@@ -21,6 +21,12 @@ Both versions use the same timing, trigger codes, EDF messages and data columns.
 | `ChoiceRT_VPixxAudio` | left/right-ear tone | | | ✓ |
 | `ChoiceRT_Combined` | left/right-ear tone | ✓ | ✓ | ✓ |
 
+One sample is **Coder only** and uses a different task:
+
+| Experiment | Task | Pixel Mode triggers | VPixx audio |
+|---|---|---|---|
+| `VoiceRT_VPixxMic` | read a word aloud; DATAPixx3 records the microphone | ✓ | ✓ (MIC input) |
+
 ```
 builder_samples/<experiment>/   <experiment>.psyexp, conditions.csv, (images/), README.md
 coder_samples/<experiment>/     <experiment>.py,     conditions.csv, (images/), README.md
