@@ -49,6 +49,32 @@ the **last** VPixx command before the refresh. Anything that calls `DPxWriteRegC
 `DPxUpdateRegCache` between it and the refresh erases it. The `.vp` clock readings happen just
 after the refresh, so they are safe.
 
+## Checking that the tone really started on that refresh
+The start command reaches the DATAPixx3 *before* the flip, and the DATAPixx3 carries it out
+at the next refresh it sees. Normally that is the refresh that shows the trigger pixel. If
+PsychoPy drops a frame, though, the tone starts one refresh (8.3 ms) **before** its MEG
+trigger, and nothing else in the data would show it. So every tone is checked:
+
+1. Just before the start command, `onsetEvents` calls `dp.DPxSetMarker()`. The DATAPixx3 then
+   notes its own clock time (the "marker") at the moment the command takes effect, which is
+   when the tone actually starts.
+2. After the flip, `recordVpixxTime` saves `tone.vp`, the DATAPixx3 clock just after the
+   refresh that showed the tone's trigger. Then `checkToneFrame` (in `triggerSetup`) reads the
+   marker with `dp.DPxGetMarker()` and compares the two.
+3. On the same refresh, `tone.vp` comes 1–2 ms after the marker. A gap of 8 ms or more means
+   the tone started a refresh early. A negative gap means the marker wasn't taken when
+   expected. Either way the trial fails the check.
+
+A trial passes if the gap is at least 0 and below `SAME_FRAME_MAX_MS` (4 ms, half a refresh at
+120 Hz). Each trial's result is saved as `tone.same_frame` (1 = same refresh, 0 = not), with
+`tone.audio_vp` and `tone.gap_ms`, in both the PsychoPy CSV and the trial log. A trial that
+fails also prints a warning in the console. Before analysing a session, check that
+`tone_same_frame` is 1 on every trial, and drop or correct any trial where it isn't.
+
+This checks the DATAPixx3's timing against itself. It doesn't include the acoustic delay to
+the ear; to measure that, record the sound (a microphone at the earpiece) on an analog
+channel of the MEG.
+
 ## Pixel Mode is only on during the trials
 The EyeLink plugin draws its own calibration and drift-check screens. Whatever colour those
 put in the top-left pixel would reach the MEG as junk triggers. So:
@@ -75,7 +101,8 @@ experiment that only affects the picture:
 - **Tone (triggers 2/4, `TONE_ONSET_*`, `resp.rt`): no correction.** The DATAPixx3 starts the
   tone at the same vsync it sends the trigger, and sound doesn't go through the projector.
   So the trigger marks the real tone onset (apart from the acoustic delay to the ear, see
-  Sound), and `resp.rt` is the true time from tone onset.
+  Sound), and `resp.rt` is the true time from tone onset. `tone.same_frame` confirms the
+  shared vsync on every trial.
 - **Fixation cross (trigger 1, `fixation_ONSET`, `fixation_onset_s`, `fixation.vp`):** the cross
   is visible about 8.33 ms after these. Add 8.33 ms if you need its visible onset.
 
@@ -95,6 +122,7 @@ experiment that only affects the picture:
 | trial timing | `trialSetup` |
 | screen, viewing distance, cross size (in degrees) | `stimSettings` |
 | trigger values | `triggerSetup` |
+| the same-refresh limit (`SAME_FRAME_MAX_MS`) | `triggerSetup` |
 
 ## Code components
 Every code component starts with a comment block. It says when the component runs, what it
@@ -105,15 +133,15 @@ out of sight. Each line is explained.
 |---|---|---|
 | `elConfig` (eyelinkSetup) | Begin Routine | set 500 Hz; write SESSION_CONFIG |
 | `vpixxSetup` (instruct) | Before / Begin Experiment | load pypixxlib; real or dummy mode; full-screen check; connect (Pixel Mode off); close at exit |
-| `triggerSetup` (instruct) | Before / Begin Experiment | trigger colours; the trigger pixel; `setTriggerPixel`, `sendTrigger`, `recordVpixxTime` |
+| `triggerSetup` (instruct) | Before / Begin Experiment | trigger colours; the trigger pixel; `setTriggerPixel`, `sendTrigger`, `recordVpixxTime`, `checkToneFrame` |
 | `toneSetup` (instruct) | Before / Begin Experiment | make the tone; audio on, volume, copy the tone to the DATAPixx3; dummy-mode sounds |
 | `taskStartMsg` (instruct) | End Routine | write TASK_START |
 | `pixelModeOn` (triggersOn) | Begin Routine | switch Pixel Mode on |
 | `stimSettings` (trial) | Before Experiment | screen + cross size, degrees → pixels |
 | `trialSetup` (trial) | Before Experiment | trial timing |
-| | Begin Routine | random foreperiod; tone time; this trial's audio schedule |
+| | Begin Routine | random foreperiod; tone time; this trial's audio schedule; clear last trial's clock times and check |
 | | End Routine | score the response; `timeout`; TRIAL_SUMMARY + timeout EDF messages |
-| `onsetEvents` (trial) | Each Frame | trigger 1 at fixation; at the tone: EDF message, trigger 2/4, start the tone |
+| `onsetEvents` (trial) | Each Frame | trigger 1 at fixation; at the tone: EDF message, trigger 2/4, marker + start the tone, queue `checkToneFrame` |
 | `trialLog` (trial) | Begin Experiment / End Routine | create the trial log; add one row per trial |
 | `pixelModeOff` (thanks) | Begin Routine | switch Pixel Mode off |
 | `taskEndMsg` (thanks) | Begin Routine | write TASK_END |
@@ -155,6 +183,9 @@ copying the EDF, before Builder reaches its End Experiment tabs. So:
 | `fixation.trigger`, `tone.trigger` | trigger number sent (1; 2 or 4) |
 | `fixation.vp`, `tone.vp` | DATAPixx3 clock at that refresh (empty in dummy mode) |
 | `tone.started` | PsychoPy clock time of the refresh at which the tone started |
+| `tone.audio_vp` | DATAPixx3 clock when the tone actually started (the marker; empty in dummy mode) |
+| `tone.gap_ms` | `tone.vp` minus `tone.audio_vp`, in ms (empty in dummy mode) |
+| `tone.same_frame` | 1 = the tone started on its trigger's refresh, 0 = it did not (empty in dummy mode) |
 | `foreperiod` | this trial's random wait (s) |
 | `timeout` | 1 = no answer within 1.5 s, 0 = answered |
 | `dummy_vpixx` | True if run without the DATAPixx3 |
@@ -166,14 +197,15 @@ Its columns:
 - `tone_side`, `corr_ans`, `foreperiod_s`
 - `fixation_onset_s`, `tone_onset_s` (PsychoPy clock)
 - `fixation_vp`, `tone_vp` (DATAPixx3 clock)
+- `tone_audio_vp`, `tone_gap_ms`, `tone_same_frame` (the same-refresh check; `NA` in dummy mode)
 - `resp_key`, `rt_s` (both `NA` on timeouts), `correct`, `timeout`, `dummy_vpixx`
 
 Everything goes into `results/<EDFname>_<date>/`, together with the EDF.
 
 ## Dummy modes (independent)
 - **EyeLink:** the Dummy Mode tick box on the `Initialize` component.
-- **VPixx:** the `dummy_vpixx` tick box in the start dialog. You get no MEG triggers and empty
-  `.vp` columns, and the tone plays through PsychoPy in the correct ear, but **not** precisely
+- **VPixx:** the `dummy_vpixx` tick box in the start dialog. You get no MEG triggers, empty
+  `.vp` columns and no same-refresh check, and the tone plays through PsychoPy in the correct ear, but **not** precisely
   timed. If `pypixxlib` isn't installed, VPixx dummy mode turns on by itself and a warning is
   printed, so check the console before a real recording.
 

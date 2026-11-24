@@ -47,6 +47,8 @@ THE TASK
 
 On the frame the tone is due, three things are lined up for the SAME
 screen refresh: the EDF message, the MEG trigger and the tone itself.
+Straight after that refresh, the script checks that the tone really did
+start on it (column tone.same_frame; see checkToneFrame in section 10).
 
 ---------------------------------------------------------------------
 HOW TO RUN IT
@@ -233,6 +235,15 @@ TRIG_FIXATION = (0, 0, 1)   # fixation cross appears      -> MEG trigger 1
 TRIG_TONE_L   = (0, 0, 2)   # tone starts, LEFT ear       -> MEG trigger 2
 TRIG_TONE_R   = (0, 0, 4)   # tone starts, RIGHT ear      -> MEG trigger 4
 TRIG_OFF      = (0, 0, 0)   # black pixel                 -> all lines off
+
+# ---- Checking that each tone starts on its trigger's refresh ---------
+# After every tone, checkToneFrame (section 10) compares the DATAPixx3's record of
+# when the tone actually started with the screen refresh that carried
+# its MEG trigger. The gap between the two must be smaller than this
+# for them to count as the same refresh. One refresh at 120 Hz lasts
+# 8.33 ms, so half a refresh (about 4 ms) separates "same refresh" from
+# "one refresh apart".
+SAME_FRAME_MAX_MS = 4.0
 
 # ---- The tone --------------------------------------------------------
 toneFreqHz = 1000          # pitch of the tone, in Hz (cycles per second)
@@ -653,6 +664,61 @@ def sendTrigger(colour, stimName):
     win.callOnFlip(recordVpixxTime, stimName)
 
 
+# ---- Checking that the tone starts on its trigger's refresh ------
+# WHY: Section 19 sends the tone's "start" command to the DATAPixx3
+# BEFORE the screen refresh, and the DATAPixx3 carries it out at the
+# next refresh it sees. Normally that is the refresh that also shows the
+# tone's trigger pixel. But if PsychoPy is too slow to get the new frame
+# ready in time (a "dropped frame"), the DATAPixx3 starts the tone one
+# refresh EARLY, 8.3 ms before its MEG trigger, and nothing else in the
+# data would show it.
+#
+# HOW WE CHECK:
+#   - Just before that "start" command, Section 19 calls
+#     dp.DPxSetMarker(). This makes the DATAPixx3 note its own clock time
+#     (the "marker") at the moment the command takes effect, which is the
+#     moment the tone actually starts. dp.DPxGetMarker() reads it back.
+#   - tone.vp is the DATAPixx3 clock read just after the refresh that
+#     showed the tone's trigger (recordVpixxTime above).
+#   - If both happened at the same refresh, tone.vp comes a millisecond
+#     or two after the marker. If the tone started one refresh early,
+#     the gap is 8 ms or more. A negative gap means the marker was not
+#     taken when expected, so that trial fails the check too.
+#
+# The results for the current trial, looked up by name:
+#   toneCheck['audio_vp']   - DATAPixx3 clock when the tone started
+#   toneCheck['gap_ms']     - tone.vp minus that, in milliseconds
+#   toneCheck['same_frame'] - 1 = same refresh, 0 = NOT the same refresh
+toneCheck = {}
+
+
+def checkToneFrame():
+    """Check that the tone started at the same screen refresh as its MEG
+    trigger, and save the result in the data file.
+    Section 19 arranges for this to run straight after that refresh,
+    after recordVpixxTime('tone'), so tone.vp is already known."""
+    if DUMMY_VPIXX:
+        return                     # no device, nothing to check: leave it empty
+    dp.DPxUpdateRegCache()         # fetch the device's state, incl. the marker
+    toneCheck['audio_vp'] = dp.DPxGetMarker()
+    # The gap, turned from seconds into milliseconds.
+    gapMs = (vpixxTimes['tone'] - toneCheck['audio_vp']) * 1000
+    toneCheck['gap_ms'] = round(gapMs, 3)      # keep 3 decimal places
+    # "0 <= gapMs < SAME_FRAME_MAX_MS" is True only if the gap is at
+    # least 0 AND below the limit. int() turns True/False into 1/0.
+    toneCheck['same_frame'] = int(0 <= gapMs < SAME_FRAME_MAX_MS)
+    thisExp.addData('tone.audio_vp', toneCheck['audio_vp'])
+    thisExp.addData('tone.gap_ms', toneCheck['gap_ms'])
+    thisExp.addData('tone.same_frame', toneCheck['same_frame'])
+    if not toneCheck['same_frame']:
+        # A warning in the console and the PsychoPy log. In the text,
+        # %d is replaced by a whole number and %.2f / %.1f by a number
+        # with 2 / 1 decimal places, in the order listed after the "%".
+        logging.warning('Trial %d: the tone and its MEG trigger were NOT on '
+                        'the same screen refresh (gap %.2f ms; expected 0 to '
+                        '%.1f ms).' % (trials.thisN + 1, gapMs, SAME_FRAME_MAX_MS))
+
+
 # ---- The tone ----------------------------------------------------------
 # HOW THE SOUND IS PLAYED:
 #   1. Now, once: copy the tone into the DATAPixx3's memory.
@@ -942,6 +1008,7 @@ kb = keyboard.Keyboard()
 logColumns = ['participant', 'session', 'date', 'edf_file', 'trial',
               'eyelink_trialid', 'tone_side', 'corr_ans', 'foreperiod_s',
               'fixation_onset_s', 'tone_onset_s', 'fixation_vp', 'tone_vp',
+              'tone_audio_vp', 'tone_gap_ms', 'tone_same_frame',
               'resp_key', 'rt_s', 'correct', 'timeout', 'dummy_vpixx']
 # Open the file for writing ('w'), then write the row of column names.
 # '\t'.join(...) puts a tab between the names; '\n' ends the line.
@@ -1230,6 +1297,9 @@ for thisTrial in trials:
     # Forget last trial's DATAPixx3 clock times. .clear() empties the dict.
     vpixxTimes.clear()
 
+    # Forget last trial's same-refresh check (see checkToneFrame).
+    toneCheck.clear()
+
     # ---- MarkEvents: trial variables and Data Viewer files --------------
     # "!V TRIAL_VAR name value" lines become trial variables in Data Viewer.
     for i, (name, value) in enumerate([('toneSide', toneSide), ('corrAns', corrAns),
@@ -1333,9 +1403,13 @@ for thisTrial in trials:
             else:
                 sendTrigger(TRIG_TONE_R, 'tone')
 
-            # c) The tone. This must be the LAST VPixx command before the
+            # c) The tone. These must be the LAST VPixx commands before the
             #    flip (see the IMPORTANT note below).
             if not DUMMY_VPIXX:
+                # Make the DATAPixx3 note its clock (the "marker") at the moment
+                # these commands take effect, i.e. when the tone actually starts.
+                # checkToneFrame reads it after the refresh.
+                dp.DPxSetMarker()
                 # Mark the schedule "start" in the local copy of the
                 # settings...
                 dp.DPxStartAudSched()
@@ -1343,11 +1417,18 @@ for thisTrial in trials:
                 # the next screen refresh, the one we are about to show
                 # with win.flip(). The tone starts exactly then.
                 dp.DPxWriteRegCacheAfterVideoSync()
-                # IMPORTANT: between these two lines and the screen
-                # refresh, nothing may call dp.DPxUpdateRegCache() or
+                # IMPORTANT: between these lines and the screen refresh,
+                # nothing may call dp.DPxUpdateRegCache() or
                 # dp.DPxWriteRegCache(). Either would replace the pending
-                # "start". (recordVpixxTime calls DPxUpdateRegCache, but
-                # only AFTER the refresh, so it is safe.)
+                # "start" and marker. (recordVpixxTime and checkToneFrame
+                # call DPxUpdateRegCache, but only AFTER the refresh, so
+                # they are safe.)
+
+                # After the refresh, check that the tone started on it (saves
+                # tone.audio_vp, tone.gap_ms and tone.same_frame). It is queued after
+                # recordVpixxTime (in sendTrigger above), so it runs after it and
+                # tone.vp is ready.
+                win.callOnFlip(checkToneFrame)
             else:
                 # Dummy mode: play the PsychoPy sound when the frame is
                 # shown. Note "play" without (): we hand over the
@@ -1441,6 +1522,10 @@ for thisTrial in trials:
         # .get() gives 'NA' if there is no value (dummy mode).
         vpixxTimes.get('fixation', 'NA'),     # DATAPixx3 clock at the cross
         vpixxTimes.get('tone', 'NA'),         # DATAPixx3 clock at the tone
+        # The same-refresh check (checkToneFrame):
+        toneCheck.get('audio_vp', 'NA'),      # DATAPixx3 clock when the tone started
+        toneCheck.get('gap_ms', 'NA'),        # tone_vp minus that (ms)
+        toneCheck.get('same_frame', 'NA'),    # 1 = same refresh as its trigger
         respKeyText,                          # button pressed, or NA
         respRTText,                           # reaction time (s), or NA
         respCorr,                             # 1 = correct, 0 = wrong or none
